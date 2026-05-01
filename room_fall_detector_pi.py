@@ -91,7 +91,7 @@ def _torso_angle(sh_cx, sh_cy, hp_cx, hp_cy):
 # ─── Per-Person Tracker ───
 class PersonTracker:
     HISTORY = 45
-    FALL_CONFIRM = 4
+    FALL_CONFIRM = 5
     FALL_COOLDOWN = 4.0
 
     def __init__(self, person_id):
@@ -163,9 +163,9 @@ class PersonTracker:
                 pose = "Sitting"
             else:
                 pose = "Standing"
-        elif aspect_ratio > 1.0:
+        elif aspect_ratio > 1.2:
             pose = "Lying"
-        elif t_angle > 55:
+        elif t_angle > 60:
             pose = "Lying"
 
         now = time.time()
@@ -187,23 +187,23 @@ class PersonTracker:
         fall_score = 0
         n = len(self.torso_hist)
 
-        if frame_torso_vel > 8 and frame_hip_vel > 0.015:
+        if frame_torso_vel > 10 and frame_hip_vel > 0.015:
             fall_score += 2
-        if frame_torso_vel > 12:
+        if frame_torso_vel > 15:
             fall_score += 1
-        if frame_hip_vel > 0.02:
+        if frame_hip_vel > 0.025:
             fall_score += 1
 
         if n >= 4:
             t_list = list(self.torso_hist)
             h_list = list(self.hip_y_hist)
-            if t_list[-1] - t_list[-4] > 15 and h_list[-1] - h_list[-4] > 0.04:
+            if t_list[-1] - t_list[-4] > 20 and h_list[-1] - h_list[-4] > 0.05:
                 fall_score += 3
 
         if n >= 8:
             t_list = list(self.torso_hist)
             h_list = list(self.hip_y_hist)
-            if t_list[-1] - t_list[-8] > 20 and h_list[-1] - h_list[-8] > 0.06:
+            if t_list[-1] - t_list[-8] > 25 and h_list[-1] - h_list[-8] > 0.07:
                 fall_score += 3
 
         if n >= 5:

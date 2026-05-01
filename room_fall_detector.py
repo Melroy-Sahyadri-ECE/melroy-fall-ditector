@@ -176,7 +176,7 @@ class PersonTracker:
     """Tracks temporal activity history for one detected person."""
 
     HISTORY = 45
-    FALL_CONFIRM = 4       # Fewer frames needed — fall is fast
+    FALL_CONFIRM = 5       # Fewer frames needed — fall is fast
     FALL_COOLDOWN = 4.0
 
     def __init__(self, person_id):
@@ -291,9 +291,9 @@ class PersonTracker:
                 pose = "Sitting"
             else:
                 pose = "Standing"
-        elif aspect_ratio > 1.0:
+        elif aspect_ratio > 1.2:
             pose = "Sleeping" if on_bed else "Lying"
-        elif t_angle > 55:
+        elif t_angle > 60:
             pose = "Sleeping" if on_bed else "Lying"
         else:
             pose = "Standing"
@@ -317,11 +317,11 @@ class PersonTracker:
 
         # ── Signal 1: Frame-to-frame velocity spike ──
         # A single frame with huge velocity = something sudden happened
-        if frame_torso_vel > 8 and frame_hip_vel > 0.015:
+        if frame_torso_vel > 10 and frame_hip_vel > 0.015:
             fall_score += 2
-        if frame_torso_vel > 12:
+        if frame_torso_vel > 15:
             fall_score += 1
-        if frame_hip_vel > 0.02:
+        if frame_hip_vel > 0.025:
             fall_score += 1
 
         # ── Signal 2: Short window (4 frames) ──
@@ -330,7 +330,7 @@ class PersonTracker:
             h_list = list(self.hip_y_hist)
             td4 = t_list[-1] - t_list[-4]
             hd4 = h_list[-1] - h_list[-4]
-            if td4 > 15 and hd4 > 0.04:
+            if td4 > 20 and hd4 > 0.05:
                 fall_score += 3
 
         # ── Signal 3: Medium window (8-12 frames) ──
@@ -339,7 +339,7 @@ class PersonTracker:
             h_list = list(self.hip_y_hist)
             td8 = t_list[-1] - t_list[-8]
             hd8 = h_list[-1] - h_list[-8]
-            if td8 > 20 and hd8 > 0.06:
+            if td8 > 25 and hd8 > 0.07:
                 fall_score += 3
 
         if n >= 12:
