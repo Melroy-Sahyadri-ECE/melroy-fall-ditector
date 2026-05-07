@@ -19,6 +19,7 @@ Usage:
 
 import os
 os.environ["GST_PLUGIN_FEATURE_RANK"] = "vaapidecodebin:NONE"
+os.environ["QT_QPA_PLATFORM"] = "xcb" # Fix OpenCV UI on Wayland
 
 import gi
 gi.require_version('Gst', '1.0')
@@ -28,6 +29,8 @@ import numpy as np
 import cv2
 import time
 import math
+import threading
+import urllib.request
 from collections import deque
 
 import hailo
@@ -88,10 +91,74 @@ def _torso_angle(sh_cx, sh_cy, hp_cx, hp_cy):
     return abs(math.degrees(math.atan2(dx, dy)))
 
 
+import subprocess
+
+# ─── ntfy.sh Push Notification ───
+NTFY_TOPIC = "melroy-fall-detector"  # Change this to your own private topic name
+NTFY_URL = f"https://ntfy.sh/{NTFY_TOPIC}"
+NTFY_COOLDOWN = 30  # Don't send more than 1 alert per 30 seconds
+_last_ntfy_time = 0
+
+def send_fall_alert():
+    """Send a push notification to the Android app via ntfy.sh.
+    Runs in a background thread so it never blocks the video pipeline."""
+    global _last_ntfy_time
+    now = time.time()
+    if now - _last_ntfy_time < NTFY_COOLDOWN:
+        return  # Skip — already sent recently
+    _last_ntfy_time = now
+
+    def _send():
+        try:
+            req = urllib.request.Request(
+                NTFY_URL,
+                data=b"FALL DETECTED! A person has fallen in the monitored room. Please check immediately.",
+                headers={
+                    "Title": "FALL ALERT - Room Monitor",
+                    "Priority": "urgent",
+                    "Tags": "warning,rotating_light",
+                },
+            )
+            urllib.request.urlopen(req, timeout=5)
+            print(f"[NTFY] Alert sent to topic: {NTFY_TOPIC}")
+        except Exception as e:
+            print(f"[NTFY] Failed to send alert: {e}")
+
+    threading.Thread(target=_send, daemon=True).start()
+
+
+# ─── Speaker Alarm ───
+ALARM_WAV = "/home/tce/tce/melroy-fall-ditector/alarm.wav"
+ALARM_COOLDOWN = 30  # Don't play alarm more than once per 30 seconds
+_last_alarm_time = 0
+_alarm_process = None
+
+def play_alarm():
+    """Play a loud alarm through the connected speaker.
+    Runs aplay in the background so it doesn't block the video pipeline."""
+    global _last_alarm_time, _alarm_process
+    now = time.time()
+    if now - _last_alarm_time < ALARM_COOLDOWN:
+        return
+    # Don't start another alarm if one is still playing
+    if _alarm_process is not None and _alarm_process.poll() is None:
+        return
+    _last_alarm_time = now
+    try:
+        _alarm_process = subprocess.Popen(
+            ["aplay", ALARM_WAV],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        print("[ALARM] Playing alarm sound!")
+    except Exception as e:
+        print(f"[ALARM] Failed to play: {e}")
+
+
 # ─── Per-Person Tracker ───
 class PersonTracker:
     HISTORY = 45
-    FALL_CONFIRM = 5
+    FALL_CONFIRM = 4
     FALL_COOLDOWN = 4.0
 
     def __init__(self, person_id):
@@ -100,6 +167,7 @@ class PersonTracker:
         self.hip_y_hist = deque(maxlen=self.HISTORY)
         self.pose_hist = deque(maxlen=self.HISTORY)
         self.time_hist = deque(maxlen=self.HISTORY)
+        self.height_hist = deque(maxlen=self.HISTORY)
         self.fall_frames = 0
         self.safe_frames = 0
         self.is_fallen = False
@@ -108,9 +176,12 @@ class PersonTracker:
         self.last_seen = time.time()
         self.prev_torso = None
         self.prev_hip_y = None
+        self.floor_y = None
+        self.floor_samples = 0
 
     def classify(self, keypoints, confs, person_box, frame_h, frame_w):
         self.last_seen = time.time()
+        now = self.last_seen
         visible = confs > 0.3
         if visible.sum() < 6:
             return self.activity, self.is_fallen
@@ -138,6 +209,7 @@ class PersonTracker:
 
         t_angle = _torso_angle(sh_cx, sh_cy, hp_cx, hp_cy)
         hip_y_norm = hp_cy / frame_h
+        ankle_y_norm = max(l_an_y, r_an_y) / frame_h
 
         l_knee_a = _angle_3pts(l_hp_x, l_hp_y, l_kn_x, l_kn_y, l_an_x, l_an_y)
         r_knee_a = _angle_3pts(r_hp_x, r_hp_y, r_kn_x, r_kn_y, r_an_x, r_an_y)
@@ -150,11 +222,12 @@ class PersonTracker:
         bbox_w = vis_xs.max() - vis_xs.min()
         bbox_h = vis_ys.max() - vis_ys.min()
         aspect_ratio = bbox_w / max(bbox_h, 1)
+        person_height_norm = bbox_h / frame_h
 
         sh_above_hp = sh_cy < hp_cy
         nose_below_hips = nose_y > hp_cy if nose_c > 0.3 else False
 
-        # Pose classification
+        # Pose classification (original logic)
         pose = "Standing"
         if sh_above_hp:
             if nose_below_hips:
@@ -163,47 +236,56 @@ class PersonTracker:
                 pose = "Sitting"
             else:
                 pose = "Standing"
-        elif aspect_ratio > 1.2:
+        elif aspect_ratio > 1.0:
             pose = "Lying"
-        elif t_angle > 60:
+        elif t_angle > 55:
             pose = "Lying"
 
-        now = time.time()
-        self.torso_hist.append(t_angle)
-        self.hip_y_hist.append(hip_y_norm)
-        self.pose_hist.append(pose)
-        self.time_hist.append(now)
+        # Update floor reference when clearly standing
+        if pose == "Standing" and t_angle < 15 and avg_knee > 150:
+            if self.floor_y is None:
+                self.floor_y = ankle_y_norm
+                self.floor_samples = 1
+            else:
+                self.floor_y = 0.9 * self.floor_y + 0.1 * ankle_y_norm
+                self.floor_samples += 1
 
-        # Frame velocity
+        # Frame-to-frame velocity (FIX: compute BEFORE updating prev)
         frame_torso_vel = 0.0
         frame_hip_vel = 0.0
-        if self.prev_torso is not None:
+        if self.prev_torso is not None and self.prev_hip_y is not None:
             frame_torso_vel = t_angle - self.prev_torso
             frame_hip_vel = hip_y_norm - self.prev_hip_y
         self.prev_torso = t_angle
         self.prev_hip_y = hip_y_norm
 
-        # Fall scoring
+        self.torso_hist.append(t_angle)
+        self.hip_y_hist.append(hip_y_norm)
+        self.height_hist.append(person_height_norm)
+        self.pose_hist.append(pose)
+        self.time_hist.append(now)
+
+        # Fall scoring (original algorithm)
         fall_score = 0
         n = len(self.torso_hist)
 
-        if frame_torso_vel > 10 and frame_hip_vel > 0.015:
+        if frame_torso_vel > 8 and frame_hip_vel > 0.015:
             fall_score += 2
-        if frame_torso_vel > 15:
+        if frame_torso_vel > 12:
             fall_score += 1
-        if frame_hip_vel > 0.025:
+        if frame_hip_vel > 0.02:
             fall_score += 1
 
         if n >= 4:
             t_list = list(self.torso_hist)
             h_list = list(self.hip_y_hist)
-            if t_list[-1] - t_list[-4] > 20 and h_list[-1] - h_list[-4] > 0.05:
+            if t_list[-1] - t_list[-4] > 15 and h_list[-1] - h_list[-4] > 0.04:
                 fall_score += 3
 
         if n >= 8:
             t_list = list(self.torso_hist)
             h_list = list(self.hip_y_hist)
-            if t_list[-1] - t_list[-8] > 25 and h_list[-1] - h_list[-8] > 0.07:
+            if t_list[-1] - t_list[-8] > 20 and h_list[-1] - h_list[-8] > 0.06:
                 fall_score += 3
 
         if n >= 5:
@@ -216,15 +298,34 @@ class PersonTracker:
                     last_upright_t = times[i]
                     break
             if pose == "Lying" and last_upright_t > 0:
-                if 0 < now - last_upright_t < 1.5:
+                if 0 < now - last_upright_t < 2.0:
                     fall_score += 3
+
+        # BACKWARD FALL: height collapse
+        if n >= 6:
+            ht_list = list(self.height_hist)
+            max_h = max(ht_list[-6:])
+            cur_h = ht_list[-1]
+            if max_h > 0.01:
+                ratio = cur_h / max_h
+                if ratio < 0.5:
+                    fall_score += 4
+                elif ratio < 0.65:
+                    fall_score += 2
 
         was_upright = False
         if n >= 3:
             recent = list(self.pose_hist)[-15:]
             was_upright = any(p in {"Standing", "Walking", "Sitting", "Bending"} for p in recent)
 
-        sudden_fall = fall_score >= 4 and was_upright
+        # Floor-level gate: ignore falls on beds/couches
+        on_floor = True
+        if self.floor_y is not None and self.floor_samples >= 5:
+            lowest_y = vis_ys.max() / frame_h
+            if lowest_y < (self.floor_y - 0.20):
+                on_floor = False
+
+        sudden_fall = fall_score >= 4 and was_upright and on_floor
 
         if sudden_fall:
             self.fall_frames += 3
@@ -317,24 +418,21 @@ def draw_person_label(frame, box, activity, track_id, is_fallen):
 
 
 def draw_hud(frame, person_count, any_fall):
+    # HUD overlay for person count and fall status
     h, w = frame.shape[:2]
+    # Draw a semi-transparent black bar at the top
     overlay = frame.copy()
-    cv2.rectangle(overlay, (0, 0), (w, 50), (10, 10, 10), -1)
-    cv2.addWeighted(overlay, 0.75, frame, 0.25, 0, frame)
-    cv2.putText(frame, "FALL DETECTOR — Pi5 + Hailo AI HAT", (15, 22),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 220, 100), 1, cv2.LINE_AA)
-    cv2.putText(frame, f"People: {person_count}", (w - 150, 22),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (180, 180, 180), 1, cv2.LINE_AA)
-    if any_fall:
-        pulse = int(abs(np.sin(time.time() * 4)) * 180) + 75
-        cv2.rectangle(frame, (0, 0), (w - 1, h - 1), (0, 0, pulse), 5)
-        msg = "!! FALL DETECTED !!"
-        sz = cv2.getTextSize(msg, cv2.FONT_HERSHEY_SIMPLEX, 1.3, 3)[0]
-        tx, ty = (w - sz[0]) // 2, h - 35
-        cv2.rectangle(frame, (tx - 15, ty - sz[1] - 15),
-                      (tx + sz[0] + 15, ty + 15), (0, 0, 0), -1)
-        cv2.putText(frame, msg, (tx, ty),
-                    cv2.FONT_HERSHEY_SIMPLEX, 1.3, (0, 0, 255), 3, cv2.LINE_AA)
+    cv2.rectangle(overlay, (0, 0), (w, 50), (0, 0, 0), -1)
+    cv2.addWeighted(overlay, 0.4, frame, 0.6, 0, frame)
+    
+    # Text info
+    cv2.putText(frame, f"People: {person_count}", (20, 35), 
+                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2, cv2.LINE_AA)
+    
+    status_text = "FALL DETECTED!" if any_fall else "Status: Monitoring"
+    status_color = (0, 0, 255) if any_fall else (0, 255, 0)
+    cv2.putText(frame, status_text, (w - 300, 35),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.8, status_color, 2, cv2.LINE_AA)
 
 
 # ─── Hailo App Callback Class ───
@@ -438,7 +536,8 @@ def app_callback(element, buffer, user_data):
 
     if any_fall:
         print(f"[ALERT] FALL DETECTED! Frame {frame_count}")
-
+        send_fall_alert()
+        play_alarm()
     return
 
 
@@ -449,6 +548,43 @@ if __name__ == "__main__":
     print("  API:   hailo-apps (v26.x+)")
     print("=" * 55)
 
+    class CustomPoseApp(GStreamerPoseEstimationApp):
+        def get_pipeline_string(self):
+            # Use our custom compiled .so with proper threshold
+            self.post_process_so = "/home/tce/tce/hailo-rpi5-examples/hailo-apps/hailo_apps/postprocess/build/cpp/libyolov8pose_postprocess.so"
+            # Hide the raw GStreamer window — only our custom Fall Detector window shows
+            self.video_sink = "fakesink"
+            return super().get_pipeline_string()
+
     user_data = FallDetectorCallback()
-    app = GStreamerPoseEstimationApp(app_callback, user_data)
+    app = CustomPoseApp(app_callback, user_data)
+    
+    # Enable frame extraction for our custom GUI
+    # We keep use_frame = False for the app to avoid the crashing subprocess
+    app.options_menu.use_frame = False
+    user_data.use_frame = True
+    
+    from gi.repository import GLib
+    import os
+    
+    # Create a resizable window — OpenCV scales automatically with WINDOW_NORMAL
+    cv2.namedWindow("Fall Detector", cv2.WINDOW_NORMAL)
+    cv2.resizeWindow("Fall Detector", 960, 720)
+    
+    def gui_update():
+        # DRAIN THE QUEUE: Always skip to the latest frame for maximum smoothness
+        last_f = None
+        while True:
+            f = user_data.get_frame()
+            if f is None:
+                break
+            last_f = f
+            
+        if last_f is not None:
+            cv2.imshow("Fall Detector", last_f)
+            cv2.waitKey(1)
+        return True
+
+    print("Starting pipeline... (Look for 'Fall Detector' window)")
+    GLib.timeout_add(33, gui_update)  # ~30fps — matches camera rate
     app.run()
