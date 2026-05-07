@@ -1,0 +1,19 @@
+[Unit]
+Description=Room Fall Detector (Hailo AI HAT)
+After=network-online.target graphical.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=tce
+Environment=DISPLAY=:0
+Environment=XAUTHORITY=/home/tce/.Xauthority
+ExecStartPre=/bin/sleep 10
+ExecStart=/home/tce/tce/melroy-fall-ditector/start_fall_detector.sh
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=graphical.target
