@@ -1,0 +1,12 @@
+# Requirements for Raspberry Pi 5 + Hailo AI HAT (13 TOPS)
+# ─────────────────────────────────────────────────────────
+# Prerequisites (install BEFORE these packages):
+#   1. Hailo software:  sudo apt install hailo-all
+#   2. Hailo apps repo:
+#        git clone https://github.com/hailo-ai/hailo-apps.git
+#        cd hailo-apps && sudo ./install.sh
+#   3. Source env every session:  source setup_env.sh
+#
+# Then install these in the hailo-apps venv:
+numpy
+opencv-python
